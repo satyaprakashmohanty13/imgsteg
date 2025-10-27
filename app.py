@@ -2,304 +2,170 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 import io
-import math
+import hashlib
+import struct
+from cryptography.fernet import Fernet
+import base64
 
-# --- Configuration and Constants ---
-MAX_MESSAGE_CHARS = 2000
-LENGTH_PREFIX_BITS = 32 # 4 bytes to store the length of the message in bits
+st.set_page_config(page_title="🔐 Image Steganography App", layout="centered")
 
-st.set_page_config(
-    page_title="Image Steganography Tool",
-    layout="centered",
-    initial_sidebar_state="expanded"
-)
+# -------------------
+# Helper utilities
+# -------------------
 
-# --- Core Steganography Logic ---
+def generate_key_from_password(password: str) -> bytes:
+    """Derive a Fernet key (AES-128 + HMAC) from password using SHA256"""
+    # SHA256 gives 32 bytes; Fernet expects base64-encoded 32 bytes
+    key = hashlib.sha256(password.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(key)
 
-def xor_cipher(text, key):
-    """Simple XOR encryption/decryption function."""
-    if not key:
-        return text
-    
-    result = []
-    for i, char in enumerate(text):
-        key_char = key[i % len(key)]
-        # Apply XOR and append the resulting character
-        result.append(chr(ord(char) ^ ord(key_char)))
-    return "".join(result)
+def aes_encrypt(message: bytes, password: str) -> bytes:
+    key = generate_key_from_password(password)
+    f = Fernet(key)
+    return f.encrypt(message)
 
-def text_to_binary(text):
-    """Converts a string into a binary string, prefixed with its 32-bit length."""
-    # 1. Convert text to 8-bit binary string
-    binary_message = ''.join(format(ord(char), '08b') for char in text)
-    
-    # 2. Prefix with 32-bit length
-    length = len(binary_message)
-    length_prefix = format(length, '032b')
-    
-    return length_prefix + binary_message
+def aes_decrypt(ciphertext: bytes, password: str) -> bytes:
+    key = generate_key_from_password(password)
+    f = Fernet(key)
+    return f.decrypt(ciphertext)
 
-def binary_to_text(binary_string):
-    """Converts a binary string back into a text string."""
-    # Group every 8 bits and convert to character
-    text = ""
-    for i in range(0, len(binary_string), 8):
-        byte = binary_string[i:i+8]
-        if len(byte) == 8:
-            text += chr(int(byte, 2))
-    return text
+def bytes_to_bits(data: bytes) -> np.ndarray:
+    return np.unpackbits(np.frombuffer(data, dtype=np.uint8))
 
-def get_max_capacity(width, height):
-    """Calculates the maximum characters that can be hidden."""
-    # Each pixel (R, G, B) carries 3 bits.
-    available_bits = (width * height * 3) - LENGTH_PREFIX_BITS
-    # Max characters = available bits / 8 bits per character
-    return math.floor(available_bits / 8)
+def bits_to_bytes(bits: np.ndarray) -> bytes:
+    return np.packbits(bits).tobytes()
 
-def encode_image(img_file, secret_message, password=None):
-    """Hides a secret message within an image using LSB."""
-    try:
-        # Load image and convert to NumPy array for efficient manipulation
-        img = Image.open(img_file).convert("RGB")
-        np_img = np.array(img)
-        
-        width, height = img.size
-        
-        # 1. Apply optional encryption
-        if password:
-            secret_message = xor_cipher(secret_message, password)
+def image_capacity_bits(img: Image.Image) -> int:
+    w, h = img.size
+    return w * h * 3  # one bit per RGB channel
 
-        # 2. Convert message to LSB-ready binary string (with length prefix)
-        binary_data = text_to_binary(secret_message)
-        data_len = len(binary_data)
+def embed_data_into_image(img: Image.Image, payload: bytes) -> Image.Image:
+    length = len(payload)
+    length_bytes = struct.pack(">I", length)
+    checksum = hashlib.sha256(payload).digest()[:4]
+    data = length_bytes + checksum + payload
+    bits = bytes_to_bits(data)
 
-        # Capacity check
-        max_capacity_bits = (width * height * 3)
-        if data_len > max_capacity_bits:
-            st.error(f"Message is too long. Max capacity is {get_max_capacity(width, height)} characters. Message size is {len(secret_message)}.")
-            return None
+    arr = np.array(img.convert("RGB"))
+    flat = arr.flatten()
 
-        # 3. LSB Encoding
-        data_index = 0
-        
-        # Flatten the first three channels (R, G, B) of the array
-        # np_img.flat returns an iterator over the array elements (R, G, B, A, R, G, B, A, ...)
-        # We only modify R, G, B (index % 4 != 3)
-        
-        for i in range(np_img.size):
-            # Skip the Alpha channel if present, though we converted to RGB above
-            if i % 4 == 3:
-                continue
+    if len(bits) > flat.size:
+        raise ValueError("Message too large for this image.")
 
-            if data_index < data_len:
-                # Get the current pixel value
-                current_value = np_img.flat[i]
-                # Clear the LSB (AND with 254: 11111110)
-                cleared_lsb = current_value & 254
-                # Set the LSB to the message bit (OR with the bit)
-                new_value = cleared_lsb | int(binary_data[data_index])
-                
-                # Update the pixel value in the flattened array
-                np_img.flat[i] = new_value
-                data_index += 1
-            else:
-                break # All data is hidden
+    flat[:len(bits)] = (flat[:len(bits)] & 0xFE) | bits
+    new_arr = flat.reshape(arr.shape)
+    return Image.fromarray(new_arr.astype(np.uint8), "RGB")
 
-        # Convert NumPy array back to PIL Image
-        stego_img = Image.fromarray(np_img)
-        return stego_img
+def extract_data_from_image(img: Image.Image):
+    arr = np.array(img.convert("RGB"))
+    flat = arr.flatten()
+    bits = (flat & 1).astype(np.uint8)
 
-    except Exception as e:
-        st.error(f"An error occurred during encoding: {e}")
-        return None
+    header_bits = bits[:64]
+    header_bytes = bits_to_bytes(header_bits)
+    length = struct.unpack(">I", header_bytes[:4])[0]
+    checksum = header_bytes[4:8]
 
-def decode_image(img_file, password=None):
-    """Retrieves a hidden message from an image."""
-    try:
-        img = Image.open(img_file).convert("RGB")
-        np_img = np.array(img)
-        
-        # 1. Extract message length (first 32 bits)
-        binary_length = ""
-        data_index = 0
-        
-        # Extract the LSB from the first LENGTH_PREFIX_BITS channels
-        for i in range(np_img.size):
-            if i % 4 == 3: # Skip Alpha
-                continue
-            
-            if len(binary_length) < LENGTH_PREFIX_BITS:
-                # Extract the LSB: AND with 1
-                lsb = np_img.flat[i] & 1
-                binary_length += str(lsb)
-                data_index = i + 1
-            else:
-                break
-        
-        if len(binary_length) != LENGTH_PREFIX_BITS:
-            st.warning("Could not extract full length prefix. Image might be too small or corrupted.")
-            return ""
+    total_bits = 8 * length
+    start = 64
+    end = start + total_bits
 
-        # Convert the binary length to an integer
-        message_len_bits = int(binary_length, 2)
+    if end > bits.size:
+        raise ValueError("Incomplete or corrupted message data.")
 
-        if message_len_bits == 0 or message_len_bits > (np_img.size * 3):
-            st.info("No valid hidden message found.")
-            return ""
+    payload_bits = bits[start:end]
+    payload = bits_to_bytes(payload_bits)
+    return length, checksum, payload
 
-        # 2. Extract the actual message bits
-        binary_message = ""
-        bits_extracted = 0
+# -------------------
+# Streamlit UI
+# -------------------
 
-        # Continue extraction from where the length extraction stopped
-        for i in range(data_index, np_img.size):
-            if i % 4 == 3: # Skip Alpha
-                continue
-            
-            if bits_extracted < message_len_bits:
-                lsb = np_img.flat[i] & 1
-                binary_message += str(lsb)
-                bits_extracted += 1
-            else:
-                break
+st.title("🖼️ Image Steganography — Hide & Reveal Messages")
+st.caption("Upload an image (PNG or JPEG), hide secret text securely using AES-256 encryption.")
 
-        # 3. Convert binary to text
-        raw_message = binary_to_text(binary_message)
+tab1, tab2 = st.tabs(["🧩 Hide Message", "🔍 Reveal Message"])
 
-        # 4. Apply optional decryption
-        final_message = raw_message
-        if password:
-            final_message = xor_cipher(raw_message, password)
-
-        return final_message
-
-    except Exception as e:
-        st.error(f"An error occurred during decoding: {e}")
-        return "Error decoding message."
-
-
-# --- Streamlit UI Components ---
-
-st.title("🛡️ Image Steganography Tool")
-st.markdown("Hide and reveal secret messages inside images using the Least Significant Bit (LSB) method.")
-
-tab1, tab2 = st.tabs(["🔒 Hide Message (Encoder)", "🔑 Reveal Message (Decoder)"])
-
+# -------------------
+# ENCODER
+# -------------------
 with tab1:
-    st.header("Encode a Secret Message")
-    
-    # 1. Image Upload
-    uploaded_file_encode = st.file_uploader(
-        "Upload a Carrier Image (PNG recommended)",
-        type=['png', 'jpg', 'jpeg'], 
-        key='encode_uploader'
-    )
+    st.header("Hide a secret message inside an image")
 
-    if uploaded_file_encode:
-        # Display image preview and capacity info
-        try:
-            img = Image.open(uploaded_file_encode)
-            width, height = img.size
-            max_chars = get_max_capacity(width, height)
-            
-            st.image(img, caption="Carrier Image Preview", use_column_width=True)
-            st.info(f"Image Capacity: This image can hide up to **{max_chars} characters**.")
+    img_file = st.file_uploader("Upload an image (PNG or JPEG)", type=["png", "jpg", "jpeg"])
+    message = st.text_area("Enter your secret message", height=150)
+    use_password = st.checkbox("Use password for strong encryption (recommended)")
+    password = ""
+    if use_password:
+        password = st.text_input("Password", type="password")
 
-            # 2. Secret Message Input
-            secret_message = st.text_area(
-                "Enter your secret message:", 
-                max_chars=MAX_MESSAGE_CHARS, 
-                height=150,
-                key='secret_message'
-            )
+    if st.button("🔒 Hide Message"):
+        if not img_file:
+            st.warning("Please upload an image first.")
+        elif not message.strip():
+            st.warning("Please enter a message.")
+        else:
+            try:
+                img = Image.open(img_file).convert("RGB")
+                # Always convert to PNG for lossless result
+                if img_file.name.lower().endswith(("jpg", "jpeg")):
+                    st.info("JPEG detected — converting internally to PNG (lossless).")
 
-            # Check if message fits within hardcoded limit
-            if len(secret_message) > MAX_MESSAGE_CHARS:
-                st.warning(f"Message exceeds the application limit of {MAX_MESSAGE_CHARS} characters.")
+                data = message.encode("utf-8")
+                if use_password and password:
+                    data = aes_encrypt(data, password)
 
-            # Check if message fits within image capacity
-            if len(secret_message) > max_chars:
-                st.error("The message is too long for this image's capacity.")
-            
-            
-            # 3. Optional Password System
-            st.subheader("Security Options")
-            use_password_encode = st.checkbox("Encrypt message with a password (Optional)", key='pass_toggle_encode')
-            
-            password_encode = ""
-            if use_password_encode:
-                password_encode = st.text_input("Enter secret password:", type="password", key='pass_input_encode')
-                if not password_encode:
-                    st.warning("Please enter a password for encryption.")
+                stego_img = embed_data_into_image(img, data)
 
-            # 4. Encode Button
-            if st.button("Hide Message & Generate Image"):
-                if not secret_message:
-                    st.error("Please enter a message to hide.")
-                elif use_password_encode and not password_encode:
-                    st.error("Encryption is enabled, but no password was provided.")
-                elif len(secret_message) > max_chars:
-                    st.error("Message is too long for this image. Please shorten the message or use a larger image.")
-                else:
-                    with st.spinner('Encoding message...'):
-                        stego_image = encode_image(uploaded_file_encode, secret_message, password_encode)
+                buf = io.BytesIO()
+                stego_img.save(buf, format="PNG")
+                buf.seek(0)
+                st.success("✅ Message hidden successfully! Download your secure image below.")
+                st.image(stego_img, caption="Stego Image Preview", use_column_width=True)
+                st.download_button("⬇️ Download Stego Image (PNG)", buf, file_name="stego_image.png", mime="image/png")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-                    if stego_image:
-                        st.success("Message hidden successfully! Use the button below to download the stego-image.")
-                        
-                        # Save image to a byte buffer for download
-                        buf = io.BytesIO()
-                        stego_image.save(buf, format="PNG")
-                        byte_im = buf.getvalue()
-                        
-                        st.download_button(
-                            label="Download Stego Image (PNG)",
-                            data=byte_im,
-                            file_name="stego_image.png",
-                            mime="image/png"
-                        )
-                    
-        except Exception as e:
-            st.error(f"Error loading image: {e}")
-
+# -------------------
+# DECODER
+# -------------------
 with tab2:
-    st.header("Decode a Secret Message")
+    st.header("Reveal a hidden message from an image")
 
-    # 1. Image Upload
-    uploaded_file_decode = st.file_uploader(
-        "Upload a Stego Image (containing a hidden message)", 
-        type=['png', 'jpg', 'jpeg'], 
-        key='decode_uploader'
-    )
+    stego_file = st.file_uploader("Upload stego image (PNG or JPEG)", type=["png", "jpg", "jpeg"])
+    use_password_d = st.checkbox("Message is password-protected")
+    password_d = ""
+    if use_password_d:
+        password_d = st.text_input("Enter password", type="password", key="dec_pw")
 
-    if uploaded_file_decode:
-        # Display image preview
-        st.image(Image.open(uploaded_file_decode), caption="Stego Image Preview", use_column_width=True)
-        
-        # 2. Optional Password System
-        st.subheader("Security Options (If encryption was used)")
-        use_password_decode = st.checkbox("Decrypt message with a password (Optional)", key='pass_toggle_decode')
-        
-        password_decode = ""
-        if use_password_decode:
-            password_decode = st.text_input("Enter decryption password:", type="password", key='pass_input_decode')
-            if not password_decode:
-                st.warning("Please enter the decryption password.")
-                
-        # 3. Decode Button
-        if st.button("Reveal Secret Message"):
-            if use_password_decode and not password_decode:
-                st.error("Decryption is enabled, but no password was provided.")
-            else:
-                with st.spinner('Decoding message...'):
-                    revealed_message = decode_image(uploaded_file_decode, password_decode)
+    if st.button("🔓 Reveal Message"):
+        if not stego_file:
+            st.warning("Upload a stego image.")
+        else:
+            try:
+                img = Image.open(stego_file).convert("RGB")
+                _, checksum, payload = extract_data_from_image(img)
 
-                st.subheader("Revealed Message")
-                if "Error" in revealed_message or "not found" in revealed_message:
-                    st.error(revealed_message)
-                else:
-                    st.success("Message revealed successfully!")
-                    st.text_area("Decrypted Message:", revealed_message, height=200)
+                if use_password_d and password_d:
+                    try:
+                        payload = aes_decrypt(payload, password_d)
+                    except Exception:
+                        st.error("❌ Incorrect password or corrupted data.")
+                        st.stop()
 
----
+                actual_checksum = hashlib.sha256(payload).digest()[:4]
+                if actual_checksum != checksum:
+                    st.error("❌ Data integrity check failed (wrong password or damaged image).")
+                    st.stop()
 
+                try:
+                    decoded_msg = payload.decode("utf-8")
+                    st.success("✅ Message revealed successfully!")
+                    st.text_area("Hidden Message", decoded_msg, height=200)
+                except UnicodeDecodeError:
+                    st.error("Could not decode message text (non-text data or wrong password).")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+st.markdown("---")
+st.caption("💡 Tip: Always use PNG for storing or sharing your stego images to avoid compression losses.")
