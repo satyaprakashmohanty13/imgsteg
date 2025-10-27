@@ -14,8 +14,7 @@ st.set_page_config(page_title="🔐 Image Steganography App", layout="centered")
 # -------------------
 
 def generate_key_from_password(password: str) -> bytes:
-    """Derive a Fernet key (AES-128 + HMAC) from password using SHA256"""
-    # SHA256 gives 32 bytes; Fernet expects base64-encoded 32 bytes
+    """Derive a Fernet key (AES-based encryption) from password"""
     key = hashlib.sha256(password.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(key)
 
@@ -37,7 +36,7 @@ def bits_to_bytes(bits: np.ndarray) -> bytes:
 
 def image_capacity_bits(img: Image.Image) -> int:
     w, h = img.size
-    return w * h * 3  # one bit per RGB channel
+    return w * h * 3  # 1 bit per RGB channel
 
 def embed_data_into_image(img: Image.Image, payload: bytes) -> Image.Image:
     length = len(payload)
@@ -82,7 +81,7 @@ def extract_data_from_image(img: Image.Image):
 # -------------------
 
 st.title("🖼️ Image Steganography — Hide & Reveal Messages")
-st.caption("Upload an image (PNG or JPEG), hide secret text securely using AES-256 encryption.")
+st.caption("Upload an image (PNG or JPEG), hide secret text securely using AES encryption.")
 
 tab1, tab2 = st.tabs(["🧩 Hide Message", "🔍 Reveal Message"])
 
@@ -107,10 +106,8 @@ with tab1:
         else:
             try:
                 img = Image.open(img_file).convert("RGB")
-                # Always convert to PNG for lossless result
                 if img_file.name.lower().endswith(("jpg", "jpeg")):
-                    st.info("JPEG detected — converting internally to PNG (lossless).")
-
+                    st.info("JPEG detected — converting internally to PNG for better accuracy.")
                 data = message.encode("utf-8")
                 if use_password and password:
                     data = aes_encrypt(data, password)
@@ -168,4 +165,4 @@ with tab2:
                 st.error(f"Error: {e}")
 
 st.markdown("---")
-st.caption("💡 Tip: Always use PNG for storing or sharing your stego images to avoid compression losses.")
+st.caption("💡 Use PNG for best results. JPEG compression may damage hidden data.")
