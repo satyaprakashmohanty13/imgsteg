@@ -15,4 +15,4 @@ COPY app.py .
 EXPOSE 7860
 
 # Command to run the Streamlit application
-CMD ["streamlit", "run", "app.py"]
+CMD ["streamlit", "run", "app.py", "--server.port=7860", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]
