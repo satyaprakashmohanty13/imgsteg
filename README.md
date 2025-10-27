@@ -1,8 +1,8 @@
 ---
 title: Image Steganography
-emoji: 😻
-colorFrom: yellow
-colorTo: gray
+emoji: 👁
+colorFrom: purple
+colorTo: green
 sdk: docker
 pinned: false
 short_description: 'Hide messages in image with password encryption '
